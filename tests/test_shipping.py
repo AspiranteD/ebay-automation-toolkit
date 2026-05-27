@@ -1,183 +1,148 @@
-"""Tests for the eBay Shipping Service."""
-
-from unittest.mock import MagicMock, patch
-
+"""Tests for eBay shipping service."""
 import pytest
+from unittest.mock import patch, MagicMock
 
-from src.shipping.shipping_service import EbayShippingService, ShippingFulfillment
-
-
-@pytest.fixture
-def mock_auth():
-    auth = MagicMock()
-    auth.get_valid_token.return_value = "test_token"
-    return auth
+from src.shipping.shipping_service import EbayShippingService, CARRIER_MAP
 
 
 @pytest.fixture
-def shipping_service(mock_auth):
-    return EbayShippingService(auth_client=mock_auth, marketplace_id="EBAY_ES")
+def service():
+    return EbayShippingService(
+        get_token=lambda: "test_token",
+        refresh_token=lambda: None,
+    )
+
+
+class TestCarrierMapping:
+    def test_correos(self):
+        assert EbayShippingService.resolve_carrier_code("Correos") == "CORREOS"
+
+    def test_correos_de_espana(self):
+        assert EbayShippingService.resolve_carrier_code("CORREOS_DE_ESPANA") == "CORREOS"
+
+    def test_seur(self):
+        assert EbayShippingService.resolve_carrier_code("SEUR") == "SEUR"
+
+    def test_mrw(self):
+        assert EbayShippingService.resolve_carrier_code("MRW") == "MRW"
+
+    def test_gls(self):
+        assert EbayShippingService.resolve_carrier_code("GLS") == "GLS"
+
+    def test_dhl(self):
+        assert EbayShippingService.resolve_carrier_code("DHL") == "DHL"
+
+    def test_ups(self):
+        assert EbayShippingService.resolve_carrier_code("UPS") == "UPS"
+
+    def test_nacex(self):
+        assert EbayShippingService.resolve_carrier_code("NACEX") == "NACEX"
+
+    def test_correos_express(self):
+        assert EbayShippingService.resolve_carrier_code("CORREOS_EXPRESS") == "CORREOS_EXPRESS"
+
+    def test_unknown_defaults_to_correos(self):
+        assert EbayShippingService.resolve_carrier_code("RANDOM_CARRIER") == "CORREOS"
+
+    def test_empty_defaults_to_correos(self):
+        assert EbayShippingService.resolve_carrier_code("") == "CORREOS"
+
+    def test_case_insensitive(self):
+        assert EbayShippingService.resolve_carrier_code("seur") == "SEUR"
+        assert EbayShippingService.resolve_carrier_code("Gls") == "GLS"
 
 
 class TestCreateShippingFulfillment:
-    def test_creates_fulfillment_and_returns_id(self, shipping_service):
-        with patch.object(shipping_service.session, "request") as mock_req:
-            mock_req.return_value = MagicMock(
-                status_code=201,
-                headers={
-                    "Location": "https://api.ebay.com/.../shipping_fulfillment/ful-001"
-                },
-            )
+    @patch("src.shipping.shipping_service.requests.post")
+    @patch("src.shipping.shipping_service.requests.get")
+    def test_successful_fulfillment(self, mock_get, mock_post, service):
+        mock_get.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {
+                "lineItems": [
+                    {"lineItemId": "LI001", "quantity": 1},
+                    {"lineItemId": "LI002", "quantity": 1},
+                ],
+            },
+        )
 
-            fid = shipping_service.create_shipping_fulfillment(
-                order_id="ORD-001",
-                tracking_number="1Z999",
-                carrier_code="UPS",
-            )
-            assert fid == "ful-001"
+        mock_post.return_value = MagicMock(
+            status_code=201,
+            headers={"Location": "/fulfillment/FUL-001"},
+        )
 
-    def test_sends_correct_payload(self, shipping_service):
-        with patch.object(shipping_service.session, "request") as mock_req:
-            mock_req.return_value = MagicMock(
-                status_code=201,
-                headers={"Location": "/ful-001"},
-            )
+        result = service.create_shipping_fulfillment(
+            "EBAY-12345", "PK123456789ES", "Correos",
+        )
+        assert result["success"] is True
+        assert result["fulfillmentId"] == "FUL-001"
+        assert result["trackingNumber"] == "PK123456789ES"
 
-            shipping_service.create_shipping_fulfillment(
-                order_id="ORD-001",
-                tracking_number="TRACK123",
-                carrier_code="CORREOS",
-                shipped_date="2025-01-15T10:00:00.000Z",
-            )
+    @patch("src.shipping.shipping_service.requests.get")
+    def test_no_line_items_returns_error(self, mock_get, service):
+        mock_get.return_value = MagicMock(
+            status_code=404,
+        )
 
-            call_kwargs = mock_req.call_args
-            payload = call_kwargs[1]["json"]
-            assert payload["trackingNumber"] == "TRACK123"
-            assert payload["shippingCarrierCode"] == "CORREOS"
-            assert payload["shippedDate"] == "2025-01-15T10:00:00.000Z"
+        result = service.create_shipping_fulfillment(
+            "EBAY-99999", "PK000000000ES",
+        )
+        assert result["success"] is False
+        assert "No line items" in result["error"]
 
-    def test_includes_line_items(self, shipping_service):
-        with patch.object(shipping_service.session, "request") as mock_req:
-            mock_req.return_value = MagicMock(
-                status_code=201,
-                headers={"Location": "/ful-001"},
-            )
+    @patch("src.shipping.shipping_service.requests.post")
+    @patch("src.shipping.shipping_service.requests.get")
+    def test_ebay_error_response(self, mock_get, mock_post, service):
+        mock_get.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {"lineItems": [{"lineItemId": "LI1", "quantity": 1}]},
+        )
+        mock_post.return_value = MagicMock(
+            status_code=400,
+            text='{"errors": [{"message": "Invalid tracking"}]}',
+            json=lambda: {"errors": [{"message": "Invalid tracking"}]},
+        )
 
-            shipping_service.create_shipping_fulfillment(
-                order_id="ORD-001",
-                tracking_number="TRACK",
-                carrier_code="DHL",
-                line_item_ids=["item1", "item2"],
-            )
+        result = service.create_shipping_fulfillment("EBAY-123", "INVALID")
+        assert result["success"] is False
+        assert "Invalid tracking" in result["error"]
 
-            payload = mock_req.call_args[1]["json"]
-            assert len(payload["lineItems"]) == 2
-            assert payload["lineItems"][0]["lineItemId"] == "item1"
+    @patch("src.shipping.shipping_service.requests.post")
+    @patch("src.shipping.shipping_service.requests.get")
+    def test_strips_ebay_prefix(self, mock_get, mock_post, service):
+        mock_get.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {"lineItems": [{"lineItemId": "LI1", "quantity": 1}]},
+        )
+        mock_post.return_value = MagicMock(
+            status_code=201, headers={"Location": "/f/1"},
+        )
 
-    def test_auto_generates_shipped_date(self, shipping_service):
-        with patch.object(shipping_service.session, "request") as mock_req:
-            mock_req.return_value = MagicMock(
-                status_code=201,
-                headers={"Location": "/ful-001"},
-            )
-
-            shipping_service.create_shipping_fulfillment(
-                order_id="ORD-001",
-                tracking_number="T",
-                carrier_code="C",
-            )
-
-            payload = mock_req.call_args[1]["json"]
-            assert "shippedDate" in payload
-            assert "T" in payload["shippedDate"]
-
-
-class TestGetShippingFulfillments:
-    def test_returns_fulfillment_list(self, shipping_service):
-        with patch.object(shipping_service.session, "request") as mock_req:
-            mock_req.return_value = MagicMock(
-                status_code=200,
-                json=lambda: {
-                    "fulfillments": [
-                        {
-                            "fulfillmentId": "ful-001",
-                            "shipmentTrackingNumber": "1Z999",
-                            "shippingCarrierCode": "UPS",
-                            "shippedDate": "2025-01-15T10:00:00.000Z",
-                            "lineItems": [{"lineItemId": "li1"}],
-                        },
-                        {
-                            "fulfillmentId": "ful-002",
-                            "shipmentTrackingNumber": "TRACK2",
-                            "shippingCarrierCode": "CORREOS",
-                            "shippedDate": "2025-01-16T10:00:00.000Z",
-                            "lineItems": [],
-                        },
-                    ]
-                },
-            )
-
-            results = shipping_service.get_shipping_fulfillments("ORD-001")
-            assert len(results) == 2
-            assert results[0].fulfillment_id == "ful-001"
-            assert results[1].carrier_code == "CORREOS"
-
-    def test_empty_fulfillments(self, shipping_service):
-        with patch.object(shipping_service.session, "request") as mock_req:
-            mock_req.return_value = MagicMock(
-                status_code=200,
-                json=lambda: {"fulfillments": []},
-            )
-
-            results = shipping_service.get_shipping_fulfillments("ORD-001")
-            assert results == []
+        service.create_shipping_fulfillment("EBAY-ORDER-123", "T1")
+        get_url = mock_get.call_args[0][0]
+        assert "ORDER-123" in get_url
+        assert "EBAY-" not in get_url.split("/order/")[1]
 
 
-class TestFormatAddressForLabel:
-    def test_formats_complete_address(self):
-        address = {
-            "name": "Juan García López",
-            "address_line1": "Calle Mayor 10",
-            "address_line2": "2º B",
-            "city": "Madrid",
-            "state_or_province": "Madrid",
-            "postal_code": "28001",
-            "country_code": "ES",
-        }
+class TestGetFulfillments:
+    @patch("src.shipping.shipping_service.requests.get")
+    def test_returns_fulfillments(self, mock_get, service):
+        mock_get.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {
+                "fulfillments": [
+                    {"fulfillmentId": "F1", "trackingNumber": "PK111"},
+                    {"fulfillmentId": "F2", "trackingNumber": "PK222"},
+                ],
+            },
+        )
 
-        result = EbayShippingService.format_address_for_label(address)
-        lines = result.split("\n")
+        result = service.get_shipping_fulfillments("EBAY-123")
+        assert len(result) == 2
+        assert result[0]["fulfillmentId"] == "F1"
 
-        assert lines[0] == "Juan García López"
-        assert lines[1] == "Calle Mayor 10"
-        assert lines[2] == "2º B"
-        assert "Madrid" in lines[3]
-        assert "28001" in lines[3]
-        assert lines[4] == "ES"
-
-    def test_skips_empty_fields(self):
-        address = {
-            "name": "Test User",
-            "address_line1": "123 Main St",
-            "address_line2": "",
-            "city": "Barcelona",
-            "state_or_province": "",
-            "postal_code": "08001",
-            "country_code": "ES",
-        }
-
-        result = EbayShippingService.format_address_for_label(address)
-        lines = result.split("\n")
-
-        assert len(lines) == 4
-        assert "Test User" in result
-        assert "Barcelona" in result
-        assert "08001" in result
-
-    def test_handles_empty_address(self):
-        result = EbayShippingService.format_address_for_label({})
-        assert result == ""
-
-    def test_handles_only_name(self):
-        result = EbayShippingService.format_address_for_label({"name": "Solo Nombre"})
-        assert result == "Solo Nombre"
+    @patch("src.shipping.shipping_service.requests.get")
+    def test_returns_empty_on_error(self, mock_get, service):
+        mock_get.return_value = MagicMock(status_code=404)
+        result = service.get_shipping_fulfillments("EBAY-999")
+        assert result == []

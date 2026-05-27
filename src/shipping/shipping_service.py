@@ -1,158 +1,168 @@
 """
-eBay Shipping Service.
+eBay shipping fulfillment service.
 
-Creates shipping fulfillments, retrieves fulfillment details,
-and formats addresses for shipping label generation.
+Handles marking orders as shipped via the Fulfillment API and
+formatting buyer addresses for shipping labels.
+
+Key operations:
+  1. create_shipping_fulfillment: POST to eBay with tracking + carrier
+  2. get_shipping_fulfillments: GET existing fulfillments for an order
+  3. format_address_for_label: Format buyer address for label printing
+
+The Fulfillment API requires line item IDs, so the service first
+fetches the order to extract them before creating the fulfillment.
 """
-
-import os
-from dataclasses import dataclass
+import logging
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Callable, Optional
 
 import requests
 
-FULFILLMENT_API_BASE = "https://api.ebay.com/sell/fulfillment/v1"
+logger = logging.getLogger(__name__)
 
+FULFILLMENT_API = "https://api.ebay.com/sell/fulfillment/v1"
+MARKETPLACE_ID = "EBAY_ES"
 
-@dataclass
-class ShippingFulfillment:
-    fulfillment_id: str
-    tracking_number: str
-    carrier_code: str
-    shipped_date: str
-    line_items: list[dict]
+CARRIER_MAP = {
+    "CORREOS_DE_ESPANA": "CORREOS",
+    "CORREOS": "CORREOS",
+    "CORREOS_EXPRESS": "CORREOS_EXPRESS",
+    "SEUR": "SEUR",
+    "MRW": "MRW",
+    "GLS": "GLS",
+    "DHL": "DHL",
+    "UPS": "UPS",
+    "NACEX": "NACEX",
+}
 
 
 class EbayShippingService:
-    """Handles shipping fulfillment creation and address formatting."""
+    """Manages shipping fulfillments for eBay orders."""
 
-    def __init__(self, auth_client, marketplace_id: Optional[str] = None):
-        self.auth = auth_client
-        self.marketplace_id = marketplace_id or os.getenv(
-            "EBAY_MARKETPLACE_ID", "EBAY_ES"
-        )
-        self.session = requests.Session()
+    def __init__(
+        self,
+        get_token: Callable[[], str],
+        refresh_token: Callable[[], None],
+        marketplace_id: str = MARKETPLACE_ID,
+    ):
+        self._get_token = get_token
+        self._refresh_token = refresh_token
+        self._marketplace_id = marketplace_id
 
-    def _headers(self) -> dict[str, str]:
+    def _headers(self) -> dict:
         return {
-            "Authorization": f"Bearer {self.auth.get_valid_token()}",
-            "X-EBAY-C-MARKETPLACE-ID": self.marketplace_id,
+            "Authorization": f"Bearer {self._get_token()}",
+            "X-EBAY-C-MARKETPLACE-ID": self._marketplace_id,
             "Content-Type": "application/json",
-            "Accept": "application/json",
         }
-
-    def _request_with_retry(self, method: str, url: str, **kwargs) -> requests.Response:
-        kwargs.setdefault("headers", self._headers())
-        response = self.session.request(method, url, **kwargs)
-
-        if response.status_code == 401:
-            self.auth.refresh_access_token()
-            kwargs["headers"] = self._headers()
-            response = self.session.request(method, url, **kwargs)
-
-        if response.status_code >= 400:
-            raise requests.HTTPError(
-                f"Shipping API error: {response.status_code}",
-                response=response,
-            )
-        return response
 
     def create_shipping_fulfillment(
         self,
-        order_id: str,
+        request_id: str,
         tracking_number: str,
-        carrier_code: str,
-        line_item_ids: Optional[list[str]] = None,
+        carrier_code: str = "Correos",
         shipped_date: Optional[str] = None,
-    ) -> str:
+    ) -> dict:
         """
-        Mark an order as shipped by creating a shipping fulfillment.
+        Mark an order as shipped on eBay with tracking number.
 
-        Returns the fulfillment_id from the Location header.
+        Args:
+            request_id: Internal order ID (with EBAY- prefix).
+            tracking_number: Shipping tracking code (e.g., PK123456789ES).
+            carrier_code: eBay carrier code (default: Correos).
+            shipped_date: ISO-8601 date (default: now).
+
+        Returns:
+            dict with success, fulfillmentId, trackingNumber, carrierCode.
         """
-        url = f"{FULFILLMENT_API_BASE}/order/{order_id}/shipping_fulfillment"
-
-        if shipped_date is None:
+        ebay_order_id = request_id.replace("EBAY-", "")
+        if not shipped_date:
             shipped_date = datetime.now(timezone.utc).strftime(
                 "%Y-%m-%dT%H:%M:%S.000Z"
             )
 
+        line_items = self._get_order_line_items(ebay_order_id)
+        if not line_items:
+            return {"success": False, "error": "No line items found for this order"}
+
         payload = {
-            "trackingNumber": tracking_number,
-            "shippingCarrierCode": carrier_code,
+            "lineItems": [
+                {"lineItemId": li["lineItemId"], "quantity": li.get("quantity", 1)}
+                for li in line_items
+            ],
             "shippedDate": shipped_date,
+            "shippingCarrierCode": carrier_code,
+            "trackingNumber": tracking_number,
         }
 
-        if line_item_ids:
-            payload["lineItems"] = [
-                {"lineItemId": lid, "quantity": 1} for lid in line_item_ids
-            ]
+        url = f"{FULFILLMENT_API}/order/{ebay_order_id}/shipping_fulfillment"
+        resp = requests.post(url, json=payload, headers=self._headers(), timeout=30)
 
-        response = self._request_with_retry("POST", url, json=payload)
-
-        location = response.headers.get("Location", "")
-        fulfillment_id = location.rstrip("/").split("/")[-1] if location else ""
-        return fulfillment_id
-
-    def get_shipping_fulfillments(self, order_id: str) -> list[ShippingFulfillment]:
-        """Retrieve all shipping fulfillments for an order."""
-        url = f"{FULFILLMENT_API_BASE}/order/{order_id}/shipping_fulfillment"
-        response = self._request_with_retry("GET", url)
-        data = response.json()
-
-        fulfillments = []
-        for item in data.get("fulfillments", []):
-            fulfillments.append(
-                ShippingFulfillment(
-                    fulfillment_id=item.get("fulfillmentId", ""),
-                    tracking_number=item.get("shipmentTrackingNumber", ""),
-                    carrier_code=item.get("shippingCarrierCode", ""),
-                    shipped_date=item.get("shippedDate", ""),
-                    line_items=item.get("lineItems", []),
-                )
+        if resp.status_code == 401:
+            self._refresh_token()
+            resp = requests.post(
+                url, json=payload, headers=self._headers(), timeout=30
             )
-        return fulfillments
+
+        if resp.status_code in (200, 201):
+            location = resp.headers.get("Location", "")
+            fulfillment_id = location.rstrip("/").split("/")[-1] if location else ""
+
+            logger.info(
+                "Order %s marked as shipped (tracking=%s, fulfillment=%s)",
+                request_id, tracking_number, fulfillment_id,
+            )
+            return {
+                "success": True,
+                "fulfillmentId": fulfillment_id,
+                "trackingNumber": tracking_number,
+                "carrierCode": carrier_code,
+            }
+
+        error_data = resp.json() if resp.text else {}
+        errors = error_data.get("errors", [])
+        error_msg = errors[0].get("message", resp.text) if errors else resp.text
+        logger.error(
+            "Error marking shipment %s: %d - %s",
+            request_id, resp.status_code, error_msg,
+        )
+        return {"success": False, "error": error_msg, "status_code": resp.status_code}
+
+    def _get_order_line_items(self, ebay_order_id: str) -> list[dict]:
+        """Fetch line items from eBay API for the given order."""
+        url = f"{FULFILLMENT_API}/order/{ebay_order_id}"
+        resp = requests.get(url, headers=self._headers(), timeout=30)
+
+        if resp.status_code == 401:
+            self._refresh_token()
+            resp = requests.get(url, headers=self._headers(), timeout=30)
+
+        if resp.status_code != 200:
+            logger.error("Error fetching order %s: %d", ebay_order_id, resp.status_code)
+            return []
+
+        order = resp.json()
+        return [
+            {"lineItemId": li["lineItemId"], "quantity": li.get("quantity", 1)}
+            for li in order.get("lineItems", [])
+        ]
+
+    def get_shipping_fulfillments(self, request_id: str) -> list[dict]:
+        """Get existing fulfillments (shipments) for an order."""
+        ebay_order_id = request_id.replace("EBAY-", "")
+        url = f"{FULFILLMENT_API}/order/{ebay_order_id}/shipping_fulfillment"
+
+        resp = requests.get(url, headers=self._headers(), timeout=30)
+        if resp.status_code == 401:
+            self._refresh_token()
+            resp = requests.get(url, headers=self._headers(), timeout=30)
+
+        if resp.status_code != 200:
+            return []
+
+        return resp.json().get("fulfillments", [])
 
     @staticmethod
-    def format_address_for_label(address: dict) -> str:
-        """
-        Format an address dictionary into a multi-line string
-        suitable for copy/paste onto a shipping label.
-
-        Expected keys: name, address_line1, address_line2,
-                        city, state_or_province, postal_code, country_code
-        """
-        lines = []
-
-        name = address.get("name", "").strip()
-        if name:
-            lines.append(name)
-
-        line1 = address.get("address_line1", "").strip()
-        if line1:
-            lines.append(line1)
-
-        line2 = address.get("address_line2", "").strip()
-        if line2:
-            lines.append(line2)
-
-        city = address.get("city", "").strip()
-        state = address.get("state_or_province", "").strip()
-        postal = address.get("postal_code", "").strip()
-
-        city_line_parts = []
-        if city:
-            city_line_parts.append(city)
-        if state:
-            city_line_parts.append(state)
-        if postal:
-            city_line_parts.append(postal)
-        if city_line_parts:
-            lines.append(", ".join(city_line_parts))
-
-        country = address.get("country_code", "").strip()
-        if country:
-            lines.append(country)
-
-        return "\n".join(lines)
+    def resolve_carrier_code(ebay_carrier: str) -> str:
+        """Map eBay carrier code to internal carrier name."""
+        return CARRIER_MAP.get(ebay_carrier.upper(), "CORREOS") if ebay_carrier else "CORREOS"

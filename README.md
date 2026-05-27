@@ -1,212 +1,138 @@
 # eBay Automation Toolkit
 
-![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)
-![eBay REST API](https://img.shields.io/badge/eBay-REST%20API-green)
-![Tests](https://img.shields.io/badge/tests-pytest-yellow)
-![License: MIT](https://img.shields.io/badge/license-MIT-lightgrey)
-
-Production-grade Python toolkit for eBay REST API integration. Handles OAuth2 authentication, bulk listing uploads via the Feed API, order management through the Fulfillment API, and shipping automation — all in a clean, testable architecture with zero database dependencies.
+Full-stack automation toolkit for eBay seller operations: OAuth 2.0 authentication, bulk listing via Feed API, order management via Fulfillment API, shipping fulfillment, and cross-marketplace sync orchestration.
 
 ## Architecture
 
-```mermaid
-graph TD
-    subgraph Authentication
-        A[OAuth2 Client] -->|Authorization Code Grant| B[eBay Auth Server]
-        B -->|Access + Refresh Tokens| A
-        A -->|Auto-refresh on expiry| A
-    end
-
-    subgraph Feed Pipeline
-        C[CSV Listings] -->|create_task| D[Feed API]
-        D -->|upload_file| E[Task Processing]
-        E -->|poll status| F{Completed?}
-        F -->|Yes| G[Download Results]
-        F -->|No| E
-    end
-
-    subgraph Order Management
-        H[Fulfillment API] -->|fetch_orders| I[Raw eBay Orders]
-        I -->|map_order_status| J[Unified Status Model]
-        J --> K[PENDING_SHIPMENT]
-        J --> L[SHIPPED / COMPLETED]
-        J --> M[CANCELLED / REFUNDED]
-        J --> N[INCIDENT]
-    end
-
-    subgraph Shipping
-        O[Shipping Service] -->|create_fulfillment| P[Mark as Shipped]
-        O -->|format_address| Q[Shipping Label]
-    end
-
-    A --> C
-    A --> H
-    A --> O
+```
+src/
+├── auth/
+│   └── oauth2.py              # OAuth 2.0: authorization code grant, token refresh, file persistence
+├── feed/
+│   └── feed_client.py          # Feed API: task lifecycle (create → upload → poll → download)
+├── orders/
+│   ├── status.py               # 3-field status mapping (payment × fulfillment × cancel → 9 states)
+│   └── orders_service.py       # Fulfillment API: pagination, buyer extraction, tracking, LPN resolution
+├── shipping/
+│   └── shipping_service.py     # Mark shipped via API, carrier mapping, address formatting
+├── bulk/
+│   ├── category_map.py         # Parent → leaf category mapping (17 eBay.es categories)
+│   ├── csv_generator.py        # File Exchange CSV generation (Add + End actions)
+│   └── response_importer.py    # Response parsing with multi-language column detection
+└── sync/
+    └── sync_service.py         # Orchestrator: sync after extraction, full relist, dynamic days_back
 ```
 
-## Quick Start
+## Key Technical Decisions
 
-### 1. Install dependencies
+### OAuth 2.0 with File-Based Token Persistence
+- Authorization code grant flow with 4 eBay API scopes
+- Access token auto-refresh with 5-minute buffer before expiry
+- Refresh token rotation support (eBay may rotate on refresh)
+- File-based JSON storage (no database dependency for auth)
 
-```bash
-pip install -r requirements.txt
-```
+### Feed API Task Lifecycle
+- Full create → upload → poll → download pipeline
+- Automatic 401 retry with token refresh on any API call
+- Configurable poll interval and max wait with timeout detection
+- Task ID extraction from both `Location` header and response body
+- Multi-file sequential upload with result collection
 
-### 2. Configure credentials
+### 3-Field Order Status Mapping
+eBay reports order state across three independent fields:
+- `orderPaymentStatus`: PENDING | PAID | FAILED | FULLY_REFUNDED
+- `orderFulfillmentStatus`: NOT_STARTED | IN_PROGRESS | FULFILLED
+- `cancelStatus.cancelState`: NONE_REQUESTED | CANCEL_REQUESTED | CANCELED | ...
 
-```bash
-cp .env.example .env
-# Edit .env with your eBay Developer Program credentials
-```
+These are mapped to 9 unified internal states via a decision tree:
+1. Cancel state takes priority over everything
+2. Refund + FULFILLED → REEMBOLSADO (shipped then returned)
+3. Refund without fulfillment → CANCELADO (never shipped)
+4. FULFILLED → ENTREGADO
+5. IN_PROGRESS → ENVIADO
+6. Default → POR_ENVIAR
 
-| Variable | Description |
-|----------|-------------|
-| `EBAY_CLIENT_ID` | Your eBay app Client ID |
-| `EBAY_CLIENT_SECRET` | Your eBay app Client Secret |
-| `EBAY_RUNAME` | Your Redirect URI Name (RuName) |
-| `EBAY_MARKETPLACE_ID` | Target marketplace (e.g., `EBAY_ES`, `EBAY_US`) |
+### Buyer Extraction from Nested JSON
+eBay orders nest buyer data deeply:
+- Name comes from `fulfillmentStartInstructions[0].shippingStep.shipTo.fullName`
+- Email has a fallback chain: shipTo → buyerRegistrationAddress
+- Phone from `shipTo.primaryPhone.phoneNumber`
+- Full address parsing with label formatting for shipping
 
-### 3. Run the demo
+### LPN Resolution with Legacy Suffix
+SKU-to-inventory matching with fallback for pre-system listings:
+- Direct match: `LPNWE001` → found in inventory
+- Legacy suffix strip: `LPNWE001AB` → try `LPNWE001` (2-letter alpha suffix)
+- Only strips if last 2 chars are alphabetic
 
-```bash
-python examples/full_workflow.py
-```
+### Tracking Extraction with Multiple Fallbacks
+- Primary: `fulfillments[].shipmentTrackingNumber` (list or string)
+- Fallback: `lineItems[].deliveryAddress.fulfillments[].shipmentTrackingNumber`
+- Handles both list and string responses from eBay API
 
-## Usage Examples
+### Bulk CSV Generation (File Exchange Format)
+- Title generation: brand + model + description, truncated to 80 chars with condition suffix and unique ID
+- Price markup from source marketplace price with minimum enforcement
+- Condition mapping: PERFECTO→3000 (Used), CON_TARA→3000, PARA_PIEZAS→7000 (For parts)
+- Image pipe-separation (up to 12 URLs)
+- Text sanitization: strips newlines/tabs/Unicode control chars that break CSV
+- Business policies vs manual shipping/return/payment config
+- Category mapping: Amazon department/category/subcategory → eBay leaf categories
+- Chunking: max 1000 items per file
 
-### OAuth2 Authentication
+### Response File Parsing
+- Multi-language column detection (English: "ItemID", Spanish: "Resultado", etc.)
+- Pattern matching with partial match fallback
+- Add vs End action detection
+- Batch import with JSON dedup tracking
+- Source vs response file discrimination
 
-```python
-from src.auth import EbayOAuth2Client
+### Sync Orchestration
+- Dynamic `days_back` calculation based on last import timestamp
+- If server was down, requests more history (bounded 7–90 days, +2 safety margin)
+- Post-extraction sync: import orders → end cross-channel sold items → upload new listings
+- Full relist: end all active → wait → re-upload all (search positioning)
+- Error isolation: each step continues even if previous fails
 
-auth = EbayOAuth2Client()
-
-# Step 1: Get the authorization URL
-url = auth.get_authorization_url(state="my_session")
-print(f"Open in browser: {url}")
-
-# Step 2: Exchange the code (after user consent)
-auth.exchange_code_for_tokens("authorization_code_here")
-
-# Step 3: Use tokens (auto-refreshes when expired)
-token = auth.get_valid_token()
-headers = auth.get_auth_header()  # {"Authorization": "Bearer ..."}
-```
-
-### Bulk Listing Upload (Feed API)
-
-```python
-from src.feed import EbayFeedClient
-
-feed = EbayFeedClient(auth_client=auth)
-
-# Upload a single file and wait for processing
-result = feed.upload_and_wait("listings.csv")
-print(f"Status: {result.status}")  # COMPLETED, FAILED, COMPLETED_WITH_ERROR
-
-# Upload multiple files sequentially
-results = feed.upload_multiple(["batch_1.csv", "batch_2.csv"])
-```
-
-### Order Management (Fulfillment API)
-
-```python
-from src.orders import EbayFulfillmentClient
-
-orders_client = EbayFulfillmentClient(auth_client=auth)
-
-# Fetch recent orders with unified status mapping
-orders = orders_client.fetch_orders(days_back=7)
-
-for order in orders:
-    print(f"[{order.status}] {order.order_id} - {order.total_amount} {order.currency}")
-    if order.buyer:
-        print(f"  Ship to: {order.buyer.name}, {order.buyer.city}")
-```
-
-### Shipping Automation
-
-```python
-from src.shipping import EbayShippingService
-
-shipping = EbayShippingService(auth_client=auth)
-
-# Mark order as shipped
-fulfillment_id = shipping.create_shipping_fulfillment(
-    order_id="12-34567-89012",
-    tracking_number="1Z999AA10123456784",
-    carrier_code="UPS",
-)
-
-# Format address for shipping label
-label = shipping.format_address_for_label({
-    "name": "Juan García",
-    "address_line1": "Calle Mayor 10",
-    "city": "Madrid",
-    "postal_code": "28001",
-    "country_code": "ES",
-})
-print(label)
-```
-
-## Unified Status Model
-
-eBay uses three independent status fields per order. This toolkit maps them to a single unified state for cross-platform consistency:
-
-| eBay Payment | eBay Fulfillment | eBay Cancel State | → Unified Status |
-|---|---|---|---|
-| PAID | NOT_STARTED | NONE_REQUESTED | `PENDING_SHIPMENT` |
-| PAID | IN_PROGRESS | NONE_REQUESTED | `SHIPPED` |
-| PAID | FULFILLED | NONE_REQUESTED | `COMPLETED` |
-| * | * | CANCELLED | `CANCELLED` |
-| REFUND | * | * | `REFUNDED` |
-| FAILED | * | * | `INCIDENT` |
-| * | * | CANCEL_REQUESTED | `INCIDENT` |
-
-## Design Decisions
-
-### Why OAuth2 Authorization Code Grant (not Client Credentials)?
-
-Client credentials only provide access to public data. To manage a seller's orders, listings, and shipping, we need the authorization code flow — it grants user-consented scopes like `sell.fulfillment` and `sell.inventory` that client credentials cannot access.
-
-### Why Feed API for Bulk Listings (not Inventory API)?
-
-The Inventory API is designed for individual item CRUD operations. For bulk operations (hundreds or thousands of listings), the Feed API is significantly more efficient: upload a single CSV, let eBay process it asynchronously, and download the results. This reduces API calls from N to 3 (create → upload → download).
-
-### Why a Unified Status Model?
-
-eBay's order status is split across three independent fields (`orderPaymentStatus`, `orderFulfillmentStatus`, `cancelStatus.cancelState`). When building cross-platform tools (eBay + Amazon + Wallapop), a unified status model simplifies downstream logic — one status field to check instead of three combinations per platform.
+### Carrier Mapping
+Maps eBay carrier codes to internal names:
+- `CORREOS_DE_ESPANA` / `CORREOS` → `CORREOS`
+- `CORREOS_EXPRESS`, `SEUR`, `MRW`, `GLS`, `DHL`, `UPS`, `NACEX`
+- Unknown carriers default to `CORREOS`
 
 ## Testing
 
 ```bash
+pip install -r requirements.txt
 python -m pytest tests/ -v
 ```
 
-All HTTP calls are mocked — no eBay credentials needed to run the test suite.
+**216 tests** covering:
+- OAuth 2.0 flow (token persistence, refresh, expiry buffer, code extraction)
+- Feed API (task creation, upload, polling, timeout, 401 retry)
+- Status mapping (all cancel/refund/fulfillment combinations)
+- Buyer extraction (nested JSON, fallbacks, address formatting)
+- Tracking extraction (list, string, fallback paths)
+- LPN resolution (exact match, legacy suffix, edge cases)
+- Order parsing (fee splitting, multi-item, dates)
+- CSV generation (titles, prices, conditions, sanitization, images, policies)
+- Response parsing (column detection, status mapping, dedup)
+- Category mapping (parent→leaf, priority, case-insensitive)
+- Sync orchestration (dynamic days_back, error isolation, relist flow)
 
-## Project Structure
+## Configuration
 
+Copy `.env.example` to `.env` and configure:
+
+```bash
+EBAY_CLIENT_ID=...          # eBay Developer Program app credentials
+EBAY_CLIENT_SECRET=...
+EBAY_RUNAME=...             # Redirect URI name from eBay
+EBAY_PRICE_MARKUP_PCT=15    # % markup over source price
+EBAY_MIN_PRICE_EUR=5        # Minimum listing price
+EBAY_SHIPPING_PROFILE=...   # eBay business policy names (optional)
 ```
-ebay-automation-toolkit/
-├── src/
-│   ├── auth/oauth2.py           # OAuth2 authorization code flow + token refresh
-│   ├── feed/feed_client.py      # Feed API: bulk listing upload pipeline
-│   ├── orders/fulfillment.py    # Fulfillment API: order fetch + status mapping
-│   └── shipping/shipping_service.py  # Shipping: fulfillment creation + label formatting
-├── tests/                       # 30+ unit tests with mocked HTTP
-├── examples/full_workflow.py    # End-to-end demo script
-├── .env.example
-├── requirements.txt
-└── README.md
-```
-
-## Related Projects
-
-- **[AI Product Enrichment](https://github.com/AspiranteD/ai-product-enrichment)** — GPT-powered product description and metadata generation
-- **[Amazon Product Scraper](https://github.com/AspiranteD/amazon-product-scraper)** — Automated product data extraction from Amazon
-- **[Wallapop Data Extractors](https://github.com/AspiranteD/wallapop-data-extractors)** — Wallapop marketplace data collection tools
 
 ## License
 
-MIT — see [LICENSE](LICENSE) for details.
+MIT
